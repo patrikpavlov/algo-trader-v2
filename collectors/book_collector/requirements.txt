@@ -1,0 +1,4 @@
+asyncpg
+binance-connector
+APScheduler
+httpx
