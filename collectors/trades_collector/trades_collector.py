@@ -5,6 +5,7 @@ import os
 import time
 from typing import List, Optional, NamedTuple
 
+import asyncpg
 import redis.asyncio as redis
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -21,27 +22,30 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 class AppConfig(NamedTuple):
     """Holds all application configuration settings."""
-    target_pairs: List[str]
     redis_host: str
+    db_user: Optional[str]
+    db_password: Optional[str]
+    db_name: Optional[str]
+    db_host: Optional[str]
     batch_size: int
     flush_interval_seconds: int
     watchdog_interval_seconds: int
     stale_connection_threshold_seconds: int
-    max_stream_len: int 
+    max_stream_len: int
 
 def load_config() -> AppConfig:
     """Loads configuration from environment variables and provides sensible defaults."""
-    _pairs_str = os.getenv("TARGET_PAIRS", "btcusdt,ethusdt")
-    target_pairs = [pair.strip().lower() for pair in _pairs_str.split(',')]
-
     return AppConfig(
-        target_pairs=target_pairs,
         redis_host=os.getenv("REDIS_HOST", "redis"),
+        db_user=os.getenv("POSTGRES_USER"),
+        db_password=os.getenv("POSTGRES_PASSWORD"),
+        db_name=os.getenv("POSTGRES_DB"),
+        db_host=os.getenv("DB_HOST", "db"),
         batch_size=int(os.getenv("BATCH_SIZE", "200")),
         flush_interval_seconds=int(os.getenv("FLUSH_INTERVAL", "5")),
         watchdog_interval_seconds=int(os.getenv("WATCHDOG_INTERVAL", "30")),
         stale_connection_threshold_seconds=int(os.getenv("STALE_CONNECTION_THRESHOLD", "180")),
-        max_stream_len=int(os.getenv("MAX_STREAM_LEN", "1000000")), 
+        max_stream_len=int(os.getenv("MAX_STREAM_LEN", "1000000")),
     )
 
 
@@ -58,6 +62,25 @@ class TradeCollector:
         self.buffer_lock = asyncio.Lock()
         self.last_message_time = time.time()
 
+    async def _fetch_active_symbols(self) -> List[str]:
+        """Fetches the list of active symbols from the database."""
+        conn = None
+        try:
+            conn = await asyncpg.connect(
+                user=self.config.db_user, password=self.config.db_password,
+                database=self.config.db_name, host=self.config.db_host
+            )
+            records = await conn.fetch("SELECT symbol FROM monitored_symbols WHERE is_active = true")
+            symbols = [rec['symbol'] for rec in records]
+            logger.info(f"Loaded {len(symbols)} active symbols from database.")
+            return symbols
+        except Exception as e:
+            logger.critical(f"FATAL: Could not fetch symbols from database: {e}")
+            return []
+        finally:
+            if conn:
+                await conn.close()
+
     def _threadsafe_message_handler(self, msg: str) -> None:
         """Thread-safe callback that schedules the async handler on the main event loop."""
         if self.loop and not self.loop.is_closed():
@@ -73,9 +96,8 @@ class TradeCollector:
             if not trade_payload or trade_payload.get('e') != 'trade':
                 return
 
-            # Create a dictionary directly for efficient JSON serialization
             trade_data = {
-                "time": trade_payload['T'] / 1000.0,  
+                "time": trade_payload['T'] / 1000.0,
                 "symbol": trade_payload['s'].lower(),
                 "trade_id": trade_payload['t'],
                 "price": str(trade_payload['p']),
@@ -103,28 +125,27 @@ class TradeCollector:
 
         if not self.redis_client:
             logger.error("Redis client not available. Re-buffering trades.")
-            async with self.buffer_lock: # Safely re-add trades to the buffer
+            async with self.buffer_lock:
                 self.trade_buffer.extend(trades_to_flush)
             return
 
-        for attempt in range(5): # Retry up to 5 times
+        for attempt in range(5):
             try:
                 pipe = self.redis_client.pipeline()
                 for trade in trades_to_flush:
-                    # Add the maxlen argument to cap the stream
                     pipe.xadd("trades_stream", {"data": json.dumps(trade)}, maxlen=self.config.max_stream_len, approximate=True)
                 await pipe.execute()
                 logger.info(f"Successfully flushed {len(trades_to_flush)} trades to Redis Stream.")
-                return # Success! Exit the function.
+                return
 
             except redis.RedisError as e:
                 logger.warning(f"Redis flush attempt {attempt+1} failed: {e}")
-                if attempt == 4: # Last attempt failed
+                if attempt == 4:
                     logger.critical("All Redis flush attempts failed. Re-buffering trades to prevent data loss.")
-                    async with self.buffer_lock: # Safely re-add trades to the buffer
+                    async with self.buffer_lock:
                         self.trade_buffer.extend(trades_to_flush)
-                    break # Exit the retry loop
-                await asyncio.sleep(1 * (2 ** attempt)) # Exponential backoff: 1s, 2s, 4s, 8s
+                    break
+                await asyncio.sleep(1 * (2 ** attempt))
 
     async def _check_stream_health(self) -> None:
         """Watchdog to check for a stale WebSocket connection."""
@@ -141,6 +162,11 @@ class TradeCollector:
         self.loop = asyncio.get_running_loop()
         self.last_message_time = time.time()
 
+        target_pairs = await self._fetch_active_symbols()
+        if not target_pairs:
+            logger.critical("No active symbols to monitor. Shutting down.")
+            return
+
         try:
             self.redis_client = redis.from_url(f"redis://{self.config.redis_host}")
             await self.redis_client.ping()
@@ -149,13 +175,13 @@ class TradeCollector:
             logger.critical(f"FATAL: Could not connect to Redis: {e}")
             return
 
-        logger.info(f"Starting trade collector for {len(self.config.target_pairs)} pairs: {self.config.target_pairs}")
+        logger.info(f"Starting trade collector for {len(target_pairs)} pairs: {target_pairs}")
 
         client = SpotWebsocketStreamClient(
             on_message=lambda _, msg: self._threadsafe_message_handler(msg),
             is_combined=True
         )
-        client.subscribe(stream=[f"{pair}@trade" for pair in self.config.target_pairs])
+        client.subscribe(stream=[f"{pair}@trade" for pair in target_pairs])
 
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(self._flush_trades_to_redis, 'interval', seconds=self.config.flush_interval_seconds, id="redis_flush")

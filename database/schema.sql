@@ -23,3 +23,22 @@ CREATE TABLE orderbook_snapshots (
 -- Add "time" to the unique index
 CREATE UNIQUE INDEX idx_snapshots_unique ON orderbook_snapshots (time, exchange, symbol);
 SELECT create_hypertable('orderbook_snapshots', 'time');
+
+-- Symbol monitoring table
+CREATE TABLE monitored_symbols (
+    symbol TEXT PRIMARY KEY,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    date_added TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO monitored_symbols (symbol) VALUES
+('btcusdt'), ('ethusdt'), ('xrpusdt'), ('bnbusdt'), ('solusdt'),
+('dogeusdt'), ('adausdt'), ('trxusdt'), ('xlmusdt'), ('suiusdt'),
+('linkusdt'), ('hbarusdt'), ('bchusdt'), ('avaxusdt'), ('ltcusdt'),
+('shibusdt'), ('dotusdt'), ('uniusdt'), ('xmrusdt'), ('pepeusdt'),
+('aaveusdt'), ('crousdt'), ('nearusdt'), ('etcusdt'), ('aptusdt'),
+('ondousdt'), ('icpusdt'), ('kasusdt'), ('mntusdt'), ('algousdt'),
+('arbusdt'), ('vetusdt'), ('atomusdt'), ('renderusdt'), ('wldusdt'),
+('fetusdt'), ('seiusdt'), ('filusdt'), ('qntusdt'), ('jupusdt'),
+('flrusdt'), ('tiausdt'), ('flokiusdt'), ('injusdt'), ('nexousdt'),
+('crvusdt'), ('stxusdt');

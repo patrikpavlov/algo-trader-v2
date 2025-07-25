@@ -2,3 +2,4 @@ APScheduler
 binance-connector
 httpx
 redis
+asyncpg
