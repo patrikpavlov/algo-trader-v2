@@ -14,12 +14,20 @@ services:
       - .env.db
     volumes:
       - timescaledb-data:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql #
     healthcheck:
-        test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-        interval: 5s
-        timeout: 5s
-        retries: 5
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis Service
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
 
   # Trades Collector Service
   trades-collector:
@@ -30,8 +38,7 @@ services:
     env_file:
       - .env.db
     depends_on:
-      db:
-        condition: service_healthy
+      - redis
 
   # Order Book Collector Service
   book-collector:
@@ -42,8 +49,21 @@ services:
     env_file:
       - .env.db
     depends_on:
+      - redis
+
+  # Writer Service
+  writer:
+    build:
+      context: ./writer # Note: Create this new directory
+    container_name: writer
+    restart: always
+    env_file:
+      - .env.db
+    depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
 
 volumes:
   timescaledb-data:

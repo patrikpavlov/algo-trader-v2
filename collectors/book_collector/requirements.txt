@@ -1,4 +1,4 @@
-asyncpg
-binance-connector
 APScheduler
+binance-connector
 httpx
+redis
