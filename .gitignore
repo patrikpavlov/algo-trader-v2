@@ -6,3 +6,4 @@ __pycache__/
 timescaledb-data/
 cold_storage/
 venv/
+*.log
