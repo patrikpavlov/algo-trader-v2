@@ -175,6 +175,50 @@ class OrderBookCollector:
             book_state['status'] = 'SYNCED'
             logger.info(f"✅ Successfully synchronized order book for {pair}.")
 
+
+    async def _reconcile_book(self, pair: str):
+            """Periodically checks the live book against a REST snapshot."""
+            book_state = self.order_books.get(pair)
+            if not book_state or book_state['status'] != 'SYNCED':
+                return # Don't check books that aren't synced
+
+            try:
+                # Fetch a very small, fresh snapshot from the REST API
+                url = f"{self.config.binance_api_url}/depth?symbol={pair.upper()}&limit=5"
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(url, timeout=5)
+                    res.raise_for_status()
+                    snapshot = res.json()
+
+                if not snapshot.get('bids') or not snapshot.get('asks'):
+                    return
+
+                # Acquire the lock to safely read the live book state
+                async with book_state["lock"]:
+                    # Ensure the book is not empty before accessing
+                    if not book_state['bids'] or not book_state['asks']:
+                        return
+                    # Get live top of book
+                    live_top_bid = sorted(book_state['bids'].items(), key=lambda x: Decimal(x[0]), reverse=True)[0][0]
+                    live_top_ask = sorted(book_state['asks'].items(), key=lambda x: Decimal(x[0]))[0][0]
+
+                # Get snapshot top of book
+                snapshot_top_bid = snapshot['bids'][0][0]
+                snapshot_top_ask = snapshot['asks'][0][0]
+
+                # Compare. A mismatch on BOTH bid and ask is a very strong signal of de-sync.
+                if Decimal(live_top_bid) != Decimal(snapshot_top_bid) and Decimal(live_top_ask) != Decimal(snapshot_top_ask):
+                    logger.warning(
+                        f"Book for {pair} is out of sync! "
+                        f"Live Top Bid/Ask: {live_top_bid}/{live_top_ask}, "
+                        f"Snapshot Top Bid/Ask: {snapshot_top_bid}/{snapshot_top_ask}. Triggering resync."
+                    )
+                    asyncio.create_task(self._resync_book(pair))
+
+            except Exception as e:
+                logger.error(f"Error during book reconciliation for {pair}: {e}")
+
+
     async def _fetch_snapshot_with_retry(self, pair: str) -> Optional[Dict[str, Any]]:
         """Fetches the initial order book snapshot with exponential backoff."""
         url = f"{self.config.binance_api_url}/depth?symbol={pair.upper()}&limit=30"
@@ -277,6 +321,8 @@ class OrderBookCollector:
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(self._save_snapshots_to_db, 'interval', seconds=self.config.snapshot_interval_seconds)
         scheduler.add_job(self._check_stream_health, 'interval', seconds=self.config.watchdog_interval_seconds)
+        scheduler.add_job(lambda: asyncio.gather(*[self._reconcile_book(p) for p in self.config.target_pairs]), 'interval', minutes=5)
+
         scheduler.start()
         logger.info("Scheduler started.")
 
