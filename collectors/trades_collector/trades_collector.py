@@ -112,7 +112,7 @@ class TradeCollector:
 
             trade_data = TradeData(
                 time=trade_payload['T'] / 1000.0,  # Convert ms to seconds
-                symbol=trade_payload['s'],
+                symbol=trade_payload['s'].lower(),
                 trade_id=trade_payload['t'],
                 price=str(trade_payload['p']),
                 amount=str(trade_payload['q']),
