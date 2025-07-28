@@ -29,8 +29,11 @@ class AppConfig(NamedTuple):
     flush_interval_seconds: int
     stale_connection_threshold_seconds: int
     max_stream_len: int
+    stream_high_water_mark: int
+    stream_low_water_mark: int
 
 def load_config() -> AppConfig:
+    max_stream_len = int(os.getenv("MAX_STREAM_LEN", "1000000"))
     return AppConfig(
         redis_host=os.getenv("REDIS_HOST", "redis"),
         db_user=os.getenv("POSTGRES_USER"),
@@ -41,6 +44,8 @@ def load_config() -> AppConfig:
         flush_interval_seconds=int(os.getenv("FLUSH_INTERVAL", "5")),
         stale_connection_threshold_seconds=int(os.getenv("STALE_CONNECTION_THRESHOLD", "300")), # 5 minutes
         max_stream_len=int(os.getenv("MAX_STREAM_LEN", "1000000")),
+        stream_high_water_mark=int(max_stream_len * 0.8),
+        stream_low_water_mark=int(max_stream_len * 0.6)
     )
 
 # --- Application Logic ---
@@ -57,7 +62,26 @@ class TradeCollector:
         self.flush_lock = asyncio.Lock()
         self.last_message_time = 0.0
         self.reconnecting = asyncio.Event() 
+        self.collection_paused = asyncio.Event()
 
+    async def _monitor_stream_backlog(self):
+        if not self.redis_client: return
+        try:
+            stream_len = await self.redis_client.xlen("trades_stream")
+            
+            # Check if we need to PAUSE collection
+            if stream_len > self.config.stream_high_water_mark and not self.collection_paused.is_set():
+                self.collection_paused.set() # Set the event to pause collection
+                logger.warning(f"BACKPRESSURE APPLIED: Redis stream backlog ({stream_len}) exceeds high water mark ({self.config.stream_high_water_mark}). Pausing data collection.")
+            
+            # Check if we can RESUME collection
+            elif stream_len < self.config.stream_low_water_mark and self.collection_paused.is_set():
+                self.collection_paused.clear() # Clear the event to resume collection
+                logger.info(f"BACKPRESSURE RELEASED: Redis stream backlog ({stream_len}) is below low water mark ({self.config.stream_low_water_mark}). Resuming data collection.")
+
+        except Exception as e:
+            logger.error(f"Could not monitor Redis stream backlog: {e}")
+            
     async def _connect_to_redis(self):
         self.redis_client = redis.from_url(f"redis://{self.config.redis_host}")
         await self.redis_client.ping()
@@ -78,7 +102,8 @@ class TradeCollector:
     def _threadsafe_message_handler(self, _, msg: str):
         self.last_message_time = time.time()
         if self.loop and not self.loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self._process_message(msg), self.loop)
+            if not self.collection_paused.is_set():
+                asyncio.run_coroutine_threadsafe(self._process_message(msg), self.loop)
 
     async def _process_message(self, msg_str: str):
         try:
@@ -153,6 +178,7 @@ class TradeCollector:
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(self._flush_trades_to_redis, 'interval', seconds=self.config.flush_interval_seconds)
         scheduler.add_job(self._check_stream_health, 'interval', seconds=60)
+        scheduler.add_job(self._monitor_stream_backlog, 'interval', seconds=10)
         scheduler.start()
 
         logger.info(f"Trade collector is running for {len(self.target_pairs)} pairs.")

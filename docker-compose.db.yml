@@ -14,7 +14,7 @@ services:
       - .env.db
     volumes:
       - timescaledb-data:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql #
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -37,7 +37,7 @@ services:
     restart: always
     env_file:
       - .env.db
-    depends_on: 
+    depends_on:
       db:
         condition: service_healthy
       redis:
@@ -56,7 +56,7 @@ services:
     restart: always
     env_file:
       - .env.db
-    depends_on: 
+    depends_on:
       db:
         condition: service_healthy
       redis:
@@ -67,12 +67,28 @@ services:
       timeout: 10s
       retries: 3
 
-
-  # Writer Service
-  writer:
+  # Dedicated Order Book Writer Service
+  book-writer:
     build:
-      context: ./writer # Note: Create this new directory
-    container_name: writer
+      context: ./book_writer
+    restart: always
+    env_file:
+      - .env.db
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f writer.py || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Dedicated and Scalable Trades Writer Service
+  trades-writer:
+    build:
+      context: ./trades_writer
     restart: always
     env_file:
       - .env.db
