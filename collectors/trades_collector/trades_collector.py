@@ -18,10 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # --- Configuration ---
 class AppConfig(NamedTuple):
-    """Holds all application configuration settings."""
     redis_host: str
     db_user: Optional[str]
     db_password: Optional[str]
@@ -29,12 +27,10 @@ class AppConfig(NamedTuple):
     db_host: Optional[str]
     batch_size: int
     flush_interval_seconds: int
-    watchdog_interval_seconds: int
     stale_connection_threshold_seconds: int
     max_stream_len: int
 
 def load_config() -> AppConfig:
-    """Loads configuration from environment variables and provides sensible defaults."""
     return AppConfig(
         redis_host=os.getenv("REDIS_HOST", "redis"),
         db_user=os.getenv("POSTGRES_USER"),
@@ -43,11 +39,9 @@ def load_config() -> AppConfig:
         db_host=os.getenv("DB_HOST", "db"),
         batch_size=int(os.getenv("BATCH_SIZE", "200")),
         flush_interval_seconds=int(os.getenv("FLUSH_INTERVAL", "5")),
-        watchdog_interval_seconds=int(os.getenv("WATCHDOG_INTERVAL", "30")),
-        stale_connection_threshold_seconds=int(os.getenv("STALE_CONNECTION_THRESHOLD", "180")),
+        stale_connection_threshold_seconds=int(os.getenv("STALE_CONNECTION_THRESHOLD", "300")), # 5 minutes
         max_stream_len=int(os.getenv("MAX_STREAM_LEN", "1000000")),
     )
-
 
 # --- Application Logic ---
 class TradeCollector:
@@ -55,161 +49,119 @@ class TradeCollector:
         self.config = config
         self.redis_client: Optional[redis.Redis] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.shutdown_event = asyncio.Event()
-
-        # Encapsulated state
+        self.ws_client: Optional[SpotWebsocketStreamClient] = None
+        self.target_pairs: List[str] = []
+        
         self.trade_buffer: list = []
         self.buffer_lock = asyncio.Lock()
-        self.last_message_time = time.time()
+        self.flush_lock = asyncio.Lock()
+        self.last_message_time = 0.0
+        self.reconnecting = asyncio.Event() 
+
+    async def _connect_to_redis(self):
+        self.redis_client = redis.from_url(f"redis://{self.config.redis_host}")
+        await self.redis_client.ping()
+        logger.info("Connected to Redis successfully.")
 
     async def _fetch_active_symbols(self) -> List[str]:
-        """Fetches the list of active symbols from the database."""
-        conn = None
+        conn = await asyncpg.connect(
+            user=self.config.db_user, password=self.config.db_password,
+            database=self.config.db_name, host=self.config.db_host
+        )
         try:
-            conn = await asyncpg.connect(
-                user=self.config.db_user, password=self.config.db_password,
-                database=self.config.db_name, host=self.config.db_host
-            )
             records = await conn.fetch("SELECT symbol FROM monitored_symbols WHERE is_active = true")
-            symbols = [rec['symbol'] for rec in records]
-            logger.info(f"Loaded {len(symbols)} active symbols from database.")
-            return symbols
-        except Exception as e:
-            logger.critical(f"FATAL: Could not fetch symbols from database: {e}")
-            return []
+            self.target_pairs = [rec['symbol'] for rec in records]
+            return self.target_pairs
         finally:
-            if conn:
-                await conn.close()
+            await conn.close()
 
-    def _threadsafe_message_handler(self, msg: str) -> None:
-        """Thread-safe callback that schedules the async handler on the main event loop."""
+    def _threadsafe_message_handler(self, _, msg: str):
+        self.last_message_time = time.time()
         if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._process_message(msg), self.loop)
 
-    async def _process_message(self, msg_str: str) -> None:
-        """Asynchronously processes a single trade message."""
+    async def _process_message(self, msg_str: str):
         try:
-            self.last_message_time = time.time()
             msg = json.loads(msg_str)
             trade_payload = msg.get('data')
-
             if not trade_payload or trade_payload.get('e') != 'trade':
                 return
-
-            trade_data = {
-                "time": trade_payload['T'] / 1000.0,
-                "symbol": trade_payload['s'].lower(),
-                "trade_id": trade_payload['t'],
-                "price": str(trade_payload['p']),
-                "amount": str(trade_payload['q']),
-                "is_buyer_maker": trade_payload['m']
-            }
-
+            trade_data = { "time": trade_payload['T'] / 1000.0, "symbol": trade_payload['s'].lower(), "trade_id": trade_payload['t'], "price": str(trade_payload['p']), "amount": str(trade_payload['q']), "is_buyer_maker": trade_payload['m'] }
             async with self.buffer_lock:
                 self.trade_buffer.append(trade_data)
-                if len(self.trade_buffer) >= self.config.batch_size:
-                    asyncio.create_task(self._flush_trades_to_redis())
-
-        except json.JSONDecodeError:
-            logger.error(f"Could not decode JSON from message: {msg_str}")
+                should_flush = len(self.trade_buffer) >= self.config.batch_size
+            if should_flush:
+                asyncio.create_task(self._flush_trades_to_redis())
         except Exception as e:
-            logger.error(f"Critical error in message processor: {e}", exc_info=True)
+            logger.error(f"Error in message processor: {e}", exc_info=True)
 
-    async def _flush_trades_to_redis(self) -> None:
-        """Flushes the in-memory trade buffer to the Redis Stream with retries and a capped size."""
-        async with self.buffer_lock:
-            if not self.trade_buffer:
-                return
-            trades_to_flush = self.trade_buffer
-            self.trade_buffer = []
-
-        if not self.redis_client:
-            logger.error("Redis client not available. Re-buffering trades.")
+    async def _flush_trades_to_redis(self):
+        async with self.flush_lock:
             async with self.buffer_lock:
-                self.trade_buffer.extend(trades_to_flush)
-            return
-
-        for attempt in range(5):
+                if not self.trade_buffer: return
+                trades_to_flush = list(self.trade_buffer)
+                self.trade_buffer.clear()
             try:
                 pipe = self.redis_client.pipeline()
                 for trade in trades_to_flush:
                     pipe.xadd("trades_stream", {"data": json.dumps(trade)}, maxlen=self.config.max_stream_len, approximate=True)
                 await pipe.execute()
-                logger.info(f"Successfully flushed {len(trades_to_flush)} trades to Redis Stream.")
-                return
+                logger.info(f"Successfully flushed {len(trades_to_flush)} trades to Redis.")
+            except Exception as e:
+                logger.error(f"Failed to flush trades to Redis: {e}. Re-buffering.")
+                async with self.buffer_lock:
+                    self.trade_buffer = trades_to_flush + self.trade_buffer
 
-            except redis.RedisError as e:
-                logger.warning(f"Redis flush attempt {attempt+1} failed: {e}")
-                if attempt == 4:
-                    logger.critical("All Redis flush attempts failed. Re-buffering trades to prevent data loss.")
-                    async with self.buffer_lock:
-                        self.trade_buffer.extend(trades_to_flush)
-                    break
-                await asyncio.sleep(1 * (2 ** attempt))
-
-    async def _check_stream_health(self) -> None:
-        """Watchdog to check for a stale WebSocket connection."""
+    async def _check_stream_health(self):
+        if self.reconnecting.is_set(): return # Don't check health during reconnection
+        
         time_since_last_msg = time.time() - self.last_message_time
         if time_since_last_msg > self.config.stale_connection_threshold_seconds:
-            logger.critical(
-                f"Stale connection: No messages received for {time_since_last_msg:.2f}s. "
-                f"Threshold is {self.config.stale_connection_threshold_seconds}s. Initiating shutdown."
-            )
-            self.shutdown_event.set()
+            logger.warning(f"Stale connection detected ({time_since_last_msg:.0f}s). Initiating automatic reconnect.")
+            self.reconnecting.set() # Signal that we are starting a reconnect
+            asyncio.create_task(self._reconnect_client())
+        else:
+            logger.info(f"HEALTH CHECK: Trades stream is active. Last message {time_since_last_msg:.2f}s ago.")
+    
+    async def _reconnect_client(self):
+        if self.ws_client:
+            self.ws_client.stop()
+            logger.info("Old WebSocket client stopped.")
+        
+        await asyncio.sleep(5) # Brief pause
+        
+        logger.info("Attempting to start a new WebSocket client...")
+        self.ws_client = SpotWebsocketStreamClient(on_message=self._threadsafe_message_handler, is_combined=True)
+        self.ws_client.subscribe(stream=[f"{pair}@trade" for pair in self.target_pairs])
+        self.last_message_time = time.time() # Reset timer
+        self.reconnecting.clear() # Signal that reconnection is complete
+        logger.info("Reconnection complete. New client is running.")
 
-    async def run(self) -> None:
-        """The main entry point for running the collector."""
+    async def run(self):
         self.loop = asyncio.get_running_loop()
-        self.last_message_time = time.time()
-
-        target_pairs = await self._fetch_active_symbols()
-        if not target_pairs:
-            logger.critical("No active symbols to monitor. Shutting down.")
-            return
-
         try:
-            self.redis_client = redis.from_url(f"redis://{self.config.redis_host}")
-            await self.redis_client.ping()
-            logger.info("Connected to Redis successfully.")
-        except redis.RedisError as e:
-            logger.critical(f"FATAL: Could not connect to Redis: {e}")
+            await self._connect_to_redis()
+            await self._fetch_active_symbols()
+        except Exception as e:
+            logger.critical(f"FATAL: Could not connect to services on startup: {e}", exc_info=True)
             return
-
-        logger.info(f"Starting trade collector for {len(target_pairs)} pairs: {target_pairs}")
-
-        client = SpotWebsocketStreamClient(
-            on_message=lambda _, msg: self._threadsafe_message_handler(msg),
-            is_combined=True
-        )
-        client.subscribe(stream=[f"{pair}@trade" for pair in target_pairs])
-
+        
+        self.last_message_time = time.time()
+        self.ws_client = SpotWebsocketStreamClient(on_message=self._threadsafe_message_handler, is_combined=True)
+        self.ws_client.subscribe(stream=[f"{pair}@trade" for pair in self.target_pairs])
+        
         scheduler = AsyncIOScheduler(timezone="UTC")
-        scheduler.add_job(self._flush_trades_to_redis, 'interval', seconds=self.config.flush_interval_seconds, id="redis_flush")
-        scheduler.add_job(self._check_stream_health, 'interval', seconds=self.config.watchdog_interval_seconds, id="health_check")
+        scheduler.add_job(self._flush_trades_to_redis, 'interval', seconds=self.config.flush_interval_seconds)
+        scheduler.add_job(self._check_stream_health, 'interval', seconds=60)
         scheduler.start()
 
-        logger.info(f"Scheduler started with Redis flushes every {self.config.flush_interval_seconds}s.")
-        logger.info("Collector is running. Press Ctrl+C to stop.")
+        logger.info(f"Trade collector is running for {len(self.target_pairs)} pairs.")
+        while True:
+            await asyncio.sleep(3600)
 
-        try:
-            await self.shutdown_event.wait()
-        finally:
-            logger.info("Shutdown signal received. Cleaning up...")
-            scheduler.shutdown()
-            client.stop()
-            await self._flush_trades_to_redis()
-            if self.redis_client:
-                await self.redis_client.close()
-            logger.info("Collector stopped gracefully.")
-
-
-# --- Execution Entry Point ---
 if __name__ == "__main__":
     try:
-        config = load_config()
-        collector = TradeCollector(config)
+        collector = TradeCollector(load_config())
         asyncio.run(collector.run())
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("Application interrupted by user.")
-    except Exception as e:
-        logger.critical(f"A critical error occurred during startup: {e}", exc_info=True)
+        logger.info("Collector service stopped.")

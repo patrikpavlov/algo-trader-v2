@@ -37,8 +37,16 @@ services:
     restart: always
     env_file:
       - .env.db
-    depends_on:
-      - redis
+    depends_on: 
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f trades_collector.py || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Order Book Collector Service
   book-collector:
@@ -48,8 +56,17 @@ services:
     restart: always
     env_file:
       - .env.db
-    depends_on:
-      - redis
+    depends_on: 
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f book_collector.py || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 
   # Writer Service
   writer:
@@ -64,6 +81,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f writer.py || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   timescaledb-data:
