@@ -27,6 +27,14 @@ class DatabaseWriter:
         self.redis_host = os.getenv("REDIS_HOST", "redis")
         self.max_retries = 5
 
+    def _touch_heartbeat(self):
+        """Creates or updates a heartbeat file to signal liveness."""
+        try:
+            with open("/tmp/heartbeat", "w") as f:
+                f.write("healthy")
+        except Exception as e:
+            logger.warning(f"Could not write heartbeat file: {e}")
+            
     async def connect_to_db(self):
         for attempt in range(self.max_retries):
             try:
@@ -132,6 +140,12 @@ class DatabaseWriter:
     async def run(self):
         await self.connect_to_db()
         await self.connect_to_redis()
+
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        scheduler = AsyncIOScheduler(timezone="UTC")
+        scheduler.add_job(self._touch_heartbeat, 'interval', seconds=15)
+        scheduler.start()
+
         await self.process_stream("trades_stream", "trades_group", "trades-writer-1", self.handle_trade_message)
 
 if __name__ == "__main__":

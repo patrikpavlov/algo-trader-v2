@@ -3,6 +3,16 @@
 version: '3.8'
 
 services:
+
+  # Autoheal Service to restart unhealthy containers
+  autoheal:
+    image: willfarrell/autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      
   # The Database Service
   db:
     image: timescale/timescaledb:latest-pg14
@@ -29,7 +39,6 @@ services:
     ports:
       - "6379:6379"
 
-  # Trades Collector Service
   trades-collector:
     build:
       context: ./collectors/trades_collector
@@ -37,13 +46,13 @@ services:
     restart: always
     env_file:
       - .env.db
-    depends_on:
+    depends_on: 
       db:
         condition: service_healthy
       redis:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f trades_collector.py || exit 1"]
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 | grep . || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -56,13 +65,13 @@ services:
     restart: always
     env_file:
       - .env.db
-    depends_on:
+    depends_on: 
       db:
         condition: service_healthy
       redis:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f book_collector.py || exit 1"]
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 | grep . || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -80,7 +89,7 @@ services:
       redis:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f writer.py || exit 1"]
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 | grep . || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -98,10 +107,11 @@ services:
       redis:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f writer.py || exit 1"]
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 | grep . || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
 
 volumes:
   timescaledb-data:
+

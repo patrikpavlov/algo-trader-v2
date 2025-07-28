@@ -170,6 +170,14 @@ class OrderBookCollector:
                 await asyncio.sleep(2 ** attempt)
         return None
 
+    def _touch_heartbeat(self):
+        """Creates or updates a heartbeat file to signal liveness."""
+        try:
+            with open("/tmp/heartbeat", "w") as f:
+                f.write("healthy")
+        except Exception as e:
+            logger.warning(f"Could not write heartbeat file: {e}")
+
     async def _check_stream_health(self) -> None:
         now = time.time()
         for pair, book_state in self.order_books.items():
@@ -243,6 +251,8 @@ class OrderBookCollector:
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(self._save_snapshots_to_redis, 'interval', seconds=self.config.snapshot_interval_seconds)
         scheduler.add_job(self._check_stream_health, 'interval', seconds=self.config.watchdog_interval_seconds)
+        scheduler.add_job(self._touch_heartbeat, 'interval', seconds=15)
+
         scheduler.start()
         logger.info("Collector is running.")
         try:

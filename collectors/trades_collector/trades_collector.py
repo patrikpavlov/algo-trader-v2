@@ -64,6 +64,14 @@ class TradeCollector:
         self.reconnecting = asyncio.Event() 
         self.collection_paused = asyncio.Event()
 
+    def _touch_heartbeat(self):
+        """Creates or updates a heartbeat file to signal liveness."""
+        try:
+            with open("/tmp/heartbeat", "w") as f:
+                f.write("healthy")
+        except Exception as e:
+            logger.warning(f"Could not write heartbeat file: {e}")
+
     async def _monitor_stream_backlog(self):
         if not self.redis_client: return
         try:
@@ -179,6 +187,8 @@ class TradeCollector:
         scheduler.add_job(self._flush_trades_to_redis, 'interval', seconds=self.config.flush_interval_seconds)
         scheduler.add_job(self._check_stream_health, 'interval', seconds=60)
         scheduler.add_job(self._monitor_stream_backlog, 'interval', seconds=10)
+        scheduler.add_job(self._touch_heartbeat, 'interval', seconds=15)
+
         scheduler.start()
 
         logger.info(f"Trade collector is running for {len(self.target_pairs)} pairs.")
