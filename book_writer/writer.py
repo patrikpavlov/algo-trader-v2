@@ -131,9 +131,16 @@ class DatabaseWriter:
 
         try:
             async with self.db_pool.acquire() as conn:
-                await conn.executemany(sql, data)
+                await asyncio.wait_for(conn.executemany(sql, data), timeout=10.0)
+                
             logger.info(f"Successfully wrote {len(data)} records from {stream_name} to DB.")
             return True
+        
+        # Catch the new timeout error and return False to prevent data loss
+        except asyncio.TimeoutError:
+            logger.error(f"Database write for {stream_name} timed out. Batch will be retried.")
+            return False
+            
         except (asyncpg.PostgresError, OSError) as e:
             logger.error(f"Database write error for {stream_name}: {e}. Batch will be retried.", exc_info=True)
             return False
