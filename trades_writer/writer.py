@@ -77,6 +77,7 @@ class DatabaseWriter:
                     group_name, consumer_name, {stream_name: '>'}, count=500, block=2000
                 )
                 if not response:
+                    await asyncio.sleep(0.1) 
                     continue
 
                 stream, messages = response[0]
