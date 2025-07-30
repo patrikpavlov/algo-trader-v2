@@ -3,3 +3,4 @@ binance-connector
 httpx
 redis
 asyncpg
+python-json-logger
