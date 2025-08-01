@@ -42,3 +42,8 @@ INSERT INTO monitored_symbols (symbol) VALUES
 ('fetusdt'), ('seiusdt'), ('filusdt'), ('qntusdt'), ('jupusdt'),
 ('flrusdt'), ('tiausdt'), ('flokiusdt'), ('injusdt'), ('nexousdt'),
 ('crvusdt'), ('stxusdt');
+
+
+
+SELECT set_chunk_time_interval('trades', INTERVAL '6 hours');
+SELECT set_chunk_time_interval('orderbook_snapshots', INTERVAL '6 hours');
