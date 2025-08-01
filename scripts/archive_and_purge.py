@@ -1,7 +1,8 @@
+# scripts/archive_and_purge.py
 import os
 import sys
 import logging
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 def load_config():
-    """Loads configuration from environment variables with robust error checking."""
+    """Loads configuration from environment variables."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     dotenv_path = os.path.join(script_dir, '..', '.env.db')
 
@@ -34,7 +35,7 @@ def load_config():
         "db_host": "localhost",
         "db_port": os.getenv("DB_PORT", "5432"),
         "archive_path": os.getenv("ARCHIVE_PATH", "cold_storage"),
-        "retention_days": int(os.getenv("RETENTION_DAYS", "7"))
+        "retention_hours": int(os.getenv("RETENTION_HOURS", "1"))
     }
 
     if not all([config["db_user"], config["db_password"], config["db_name"]]):
@@ -43,64 +44,71 @@ def load_config():
         
     return config
 
-def archive_and_purge_daily(table_name: str, engine, retention_days: int, archive_path: str):
+def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retention_hours: int):
     """
-    Archives data older than retention_days to daily Parquet files and purges it.
+    Archives and purges TimescaleDB chunks that are older than the retention period.
     """
-    cutoff_date = date.today() - timedelta(days=retention_days)
-    logger.info(f"Processing table '{table_name}'. Archiving data older than {cutoff_date}.")
-
+    # CORRECTED: Use timezone-aware datetime object for UTC
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+    logger.info(f"Processing hypertable '{table_name}'. Finding chunks with data older than {cutoff_time.isoformat()}.")
+    
     table_archive_path = os.path.join(archive_path, table_name)
     os.makedirs(table_archive_path, exist_ok=True)
 
-    # Determine the full date range to process once
+    find_chunks_query = text("""
+        SELECT chunk_schema, chunk_name
+        FROM timescaledb_information.chunks
+        WHERE hypertable_name = :table_name AND range_end < :cutoff
+        ORDER BY range_end ASC;
+    """)
+
     try:
         with engine.connect() as connection:
-            min_date_result = connection.execute(text(f"SELECT min(time)::date FROM {table_name};")).scalar()
-    except Exception as e:
-        logger.critical(f"Could not connect to the database to determine date range. Aborting. Error: {e}")
-        return
+            eligible_chunks = connection.execute(find_chunks_query, {"table_name": table_name, "cutoff": cutoff_time}).fetchall()
 
-    if not min_date_result:
-        logger.info(f"No data found in table '{table_name}'. Nothing to do.")
-        return
+        if not eligible_chunks:
+            logger.info(f"No chunks older than the retention period found for '{table_name}'.")
+            return
 
-    # Loop through each day that needs to be archived
-    current_date = min_date_result
-    while current_date < cutoff_date:
-        day_start = current_date
-        day_end = current_date + timedelta(days=1)
-        parquet_file_path = os.path.join(table_archive_path, f"{day_start}.parquet")
-        
-        # We will now manage the connection and transaction explicitly for each day
-        try:
-            # 1. Read data for the day
-            with engine.connect() as connection:
-                extract_query = text(f"SELECT * FROM {table_name} WHERE time >= '{day_start}' AND time < '{day_end}'")
-                df = pd.read_sql(extract_query, connection)
+        logger.info(f"Found {len(eligible_chunks)} chunks to process for '{table_name}'.")
 
-            # 2. If there's data, write it to Parquet first
-            if not df.empty:
-                df.to_parquet(parquet_file_path, index=False)
-                logger.info(f"Saved {len(df)} rows to {parquet_file_path}.")
+        for chunk in eligible_chunks:
+            chunk_schema, chunk_name = chunk
+            full_chunk_name = f'"{chunk_schema}"."{chunk_name}"'
+            
+            logger.info(f"Processing chunk: {full_chunk_name}")
+            parquet_file_path = None
 
-                # 3. Only if Parquet write is successful, connect again and delete
+            try:
                 with engine.connect() as connection:
-                    with connection.begin(): # Explicitly begin a transaction
-                        purge_query = text(f"DELETE FROM {table_name} WHERE time >= '{day_start}' AND time < '{day_end}'")
-                        result = connection.execute(purge_query)
-                        logger.info(f"✅ Successfully purged {result.rowcount} rows for {day_start} from '{table_name}'.")
-            else:
-                logger.info(f"No data for {day_start} in '{table_name}', skipping.")
+                    df = pd.read_sql(f"SELECT * FROM {full_chunk_name} ORDER BY time ASC", connection)
 
-        except Exception as day_processing_error:
-            logger.error(f"Failed to process {day_start} for table '{table_name}'. Error: {day_processing_error}")
-            # Clean up partial file if it exists
-            if os.path.exists(parquet_file_path):
-                logger.warning(f"Removing partial Parquet file to ensure a clean retry: {parquet_file_path}")
-                os.remove(parquet_file_path)
-        
-        current_date += timedelta(days=1)
+                if df.empty:
+                    logger.warning(f"Chunk {full_chunk_name} is empty. Dropping it without archiving.")
+                else:
+                    start_time = pd.to_datetime(df['time'].iloc[0]).strftime('%Y%m%d-%H%M%S')
+                    end_time = pd.to_datetime(df['time'].iloc[-1]).strftime('%Y%m%d-%H%M%S')
+                    
+                    filename = f"{table_name}_from_{start_time}_to_{end_time}.parquet"
+                    parquet_file_path = os.path.join(table_archive_path, filename)
+
+                    logger.info(f"Saving {len(df)} rows from {full_chunk_name} to {parquet_file_path}")
+                    df.to_parquet(parquet_file_path, index=False)
+                
+                logger.info(f"Successfully processed chunk {full_chunk_name}. Now dropping it.")
+                with engine.connect() as connection:
+                    with connection.begin():
+                        connection.execute(text(f"SELECT drop_chunks('{full_chunk_name}');"))
+                logger.info(f"Successfully dropped chunk {full_chunk_name}.")
+
+            except Exception as e:
+                logger.error(f"Failed to process chunk {full_chunk_name}. The chunk will NOT be dropped. Error: {e}", exc_info=True)
+                if parquet_file_path and os.path.exists(parquet_file_path):
+                    logger.warning(f"Removing partial Parquet file to ensure a clean retry: {parquet_file_path}")
+                    os.remove(parquet_file_path)
+
+    except Exception as e:
+        logger.critical(f"A critical error occurred while fetching chunks for '{table_name}'. Aborting. Error: {e}")
 
 if __name__ == "__main__":
     config = load_config()
@@ -110,10 +118,10 @@ if __name__ == "__main__":
 
     tables_to_process = ["trades", "orderbook_snapshots"]
     for table in tables_to_process:
-        archive_and_purge_daily(
+        archive_and_purge_chunks(
             table_name=table,
             engine=engine,
-            retention_days=config['retention_days'],
-            archive_path=config['archive_path']
+            archive_path=config['archive_path'],
+            retention_hours=config['retention_hours']
         )
-    logger.info("Archiving process finished.")
+    logger.info("Archiving and purging process finished.")
