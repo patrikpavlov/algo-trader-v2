@@ -35,6 +35,7 @@ services:
       context: ./collectors/trades_collector
     container_name: trades-collector
     restart: always
+    cpuset: "0" 
     env_file:
       - .env.db
     depends_on: 
@@ -54,6 +55,7 @@ services:
       context: ./collectors/book_collector
     container_name: book-collector
     restart: always
+    cpuset: "1" 
     env_file:
       - .env.db
     depends_on: 
