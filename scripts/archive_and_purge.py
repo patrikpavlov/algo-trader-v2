@@ -55,7 +55,7 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
     os.makedirs(table_archive_path, exist_ok=True)
 
     find_chunks_query = text("""
-        SELECT chunk_schema, chunk_name
+        SELECT chunk_schema, chunk_name, range_start, range_end
         FROM timescaledb_information.chunks
         WHERE hypertable_name = :table_name AND range_end < :cutoff
         ORDER BY range_end ASC;
@@ -71,11 +71,11 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
 
         logger.info(f"Found {len(eligible_chunks)} chunks to process for '{table_name}'.")
 
-        for chunk in eligible_chunks:
-            chunk_schema, chunk_name = chunk
+        for chunk_info in eligible_chunks:
+            chunk_schema, chunk_name, range_start, range_end = chunk_info
             full_chunk_name = f'"{chunk_schema}"."{chunk_name}"'
             
-            logger.info(f"Processing chunk: {full_chunk_name}")
+            logger.info(f"Processing chunk: {full_chunk_name} with time range {range_start} to {range_end}")
             parquet_file_path = None
 
             try:
@@ -97,9 +97,14 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
                 logger.info(f"Successfully processed chunk {full_chunk_name}. Now dropping it.")
                 with engine.connect() as connection:
                     with connection.begin():
-                        # CORRECTED: Removed single quotes from around the chunk name
-                        connection.execute(text(f"SELECT drop_chunks({full_chunk_name});"))
-                logger.info(f"✅ Successfully dropped chunk {full_chunk_name}.")
+                        # CORRECTED: Use a simple f-string for the table name and named arguments for timestamps.
+                        # This is safe because table_name comes from the database, not user input.
+                        drop_query = text(f"SELECT drop_chunks('{table_name}', newer_than => :start_time, older_than => :end_time);")
+                        connection.execute(drop_query, {
+                            "start_time": range_start,
+                            "end_time": range_end
+                        })
+                logger.info(f"✅ Successfully dropped chunk covering range {range_start} to {range_end}.")
 
             except Exception as e:
                 logger.error(f"Failed to process chunk {full_chunk_name}. The chunk will NOT be dropped. Error: {e}", exc_info=True)
