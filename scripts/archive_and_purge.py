@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 from datetime import datetime, timedelta, timezone
+import json
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -35,11 +36,11 @@ def load_config():
         "db_host": "localhost",
         "db_port": os.getenv("DB_PORT", "5432"),
         "archive_path": os.getenv("ARCHIVE_PATH", "cold_storage"),
-        "retention_minutes": int(os.getenv("RETENTION_MINUTES", "15")) 
+        "retention_minutes": int(os.getenv("RETENTION_MINUTES", "5")) 
     }
 
     if not all([config["db_user"], config["db_password"], config["db_name"]]):
-        logger.critical("FATAL ERROR: One or more database credentials are missing from the .env.db file.")
+        logger.critical(f"FATAL ERROR: One or more database credentials are missing from the .env.db file.")
         sys.exit(1)
         
     return config
@@ -85,6 +86,25 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
                 if df.empty:
                     logger.warning(f"Chunk {full_chunk_name} is empty. Dropping it without archiving.")
                 else:
+                    # --- TRANSFORMATION LOGIC ---
+                    if table_name == 'orderbook_snapshots':
+                        logger.info("Transforming order book data to tabular format...")
+                        transformed_data = []
+                        for _, row in df.iterrows():
+                            time = row['time']
+                            symbol = row['symbol']
+                            # Bids and asks might be stored as strings, so we parse them
+                            bids = json.loads(row['bids']) if isinstance(row['bids'], str) else row['bids']
+                            asks = json.loads(row['asks']) if isinstance(row['asks'], str) else row['asks']
+                            
+                            for price, amount in bids:
+                                transformed_data.append([time, symbol, float(price), float(amount), True])
+                            for price, amount in asks:
+                                transformed_data.append([time, symbol, float(price), float(amount), False])
+                        
+                        df = pd.DataFrame(transformed_data, columns=['time', 'symbol', 'price', 'amount', 'is_bid'])
+                    # --- END OF TRANSFORMATION ---
+
                     start_time = pd.to_datetime(df['time'].iloc[0]).strftime('%Y%m%d-%H%M%S')
                     end_time = pd.to_datetime(df['time'].iloc[-1]).strftime('%Y%m%d-%H%M%S')
                     
@@ -97,8 +117,6 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
                 logger.info(f"Successfully processed chunk {full_chunk_name}. Now dropping it.")
                 with engine.connect() as connection:
                     with connection.begin():
-                        # CORRECTED: Use a simple f-string for the table name and named arguments for timestamps.
-                        # This is safe because table_name comes from the database, not user input.
                         drop_query = text(f"SELECT drop_chunks('{table_name}', newer_than => :start_time, older_than => :end_time);")
                         connection.execute(drop_query, {
                             "start_time": range_start,
