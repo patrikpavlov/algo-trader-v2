@@ -35,7 +35,7 @@ def load_config():
         "db_host": "localhost",
         "db_port": os.getenv("DB_PORT", "5432"),
         "archive_path": os.getenv("ARCHIVE_PATH", "cold_storage"),
-        "retention_hours": int(os.getenv("RETENTION_HOURS", "0.15"))
+        "retention_minutes": int(os.getenv("RETENTION_MINUTES", "15")) 
     }
 
     if not all([config["db_user"], config["db_password"], config["db_name"]]):
@@ -44,12 +44,12 @@ def load_config():
         
     return config
 
-def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retention_hours: int):
+def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retention_minutes: int):
     """
     Archives and purges TimescaleDB chunks that are older than the retention period.
     """
-    # CORRECTED: Use timezone-aware datetime object for UTC
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+    # UPDATED: Use minutes for the calculation
+    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=retention_minutes)
     logger.info(f"Processing hypertable '{table_name}'. Finding chunks with data older than {cutoff_time.isoformat()}.")
     
     table_archive_path = os.path.join(archive_path, table_name)
@@ -99,7 +99,7 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
                 with engine.connect() as connection:
                     with connection.begin():
                         connection.execute(text(f"SELECT drop_chunks('{full_chunk_name}');"))
-                logger.info(f"Successfully dropped chunk {full_chunk_name}.")
+                logger.info(f"✅ Successfully dropped chunk {full_chunk_name}.")
 
             except Exception as e:
                 logger.error(f"Failed to process chunk {full_chunk_name}. The chunk will NOT be dropped. Error: {e}", exc_info=True)
@@ -122,6 +122,6 @@ if __name__ == "__main__":
             table_name=table,
             engine=engine,
             archive_path=config['archive_path'],
-            retention_hours=config['retention_hours']
+            retention_minutes=config['retention_minutes']
         )
     logger.info("Archiving and purging process finished.")
