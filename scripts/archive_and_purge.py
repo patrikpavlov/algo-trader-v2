@@ -35,7 +35,7 @@ def load_config():
         "db_host": "localhost",
         "db_port": os.getenv("DB_PORT", "5432"),
         "archive_path": os.getenv("ARCHIVE_PATH", "cold_storage"),
-        "retention_hours": int(os.getenv("RETENTION_HOURS", "1"))
+        "retention_hours": int(os.getenv("RETENTION_HOURS", "0.15"))
     }
 
     if not all([config["db_user"], config["db_password"], config["db_name"]]):
