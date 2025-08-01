@@ -48,7 +48,6 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
     """
     Archives and purges TimescaleDB chunks that are older than the retention period.
     """
-    # UPDATED: Use minutes for the calculation
     cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=retention_minutes)
     logger.info(f"Processing hypertable '{table_name}'. Finding chunks with data older than {cutoff_time.isoformat()}.")
     
@@ -98,7 +97,8 @@ def archive_and_purge_chunks(table_name: str, engine, archive_path: str, retenti
                 logger.info(f"Successfully processed chunk {full_chunk_name}. Now dropping it.")
                 with engine.connect() as connection:
                     with connection.begin():
-                        connection.execute(text(f"SELECT drop_chunks('{full_chunk_name}');"))
+                        # CORRECTED: Removed single quotes from around the chunk name
+                        connection.execute(text(f"SELECT drop_chunks({full_chunk_name});"))
                 logger.info(f"✅ Successfully dropped chunk {full_chunk_name}.")
 
             except Exception as e:
